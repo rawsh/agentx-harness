@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 
+from unittest.mock import AsyncMock, MagicMock
+
 import pytest
 
 from aiperf.common.accumulator_protocols import ExportContext
@@ -17,7 +19,10 @@ from aiperf.config.flags.cli_config import CLIConfig
 from aiperf.config.resolution.plan import BenchmarkRun
 from aiperf.plugin.enums import EndpointType
 from aiperf.server_metrics.accumulator import ServerMetricsAccumulator
+from aiperf.server_metrics.manager import ServerMetricsManager
 from aiperf.server_metrics.storage import ServerMetricsHierarchy
+from aiperf.timing.config import _build_agentic_warmup_config
+from aiperf.timing.phase.publisher import PhasePublisher
 from tests.unit.conftest import make_run_from_cli
 
 
@@ -256,6 +261,63 @@ class TestServerMetricsAccumulator:
         warmup_avg = warmup_summary.metrics["cache_usage"].series[0].stats.avg
         assert profiling_avg == pytest.approx(0.8)
         assert warmup_avg == pytest.approx(0.15)
+
+    async def test_agentic_warmup_baseline_excludes_priming_counter(
+        self, mock_cfg: BenchmarkRun
+    ) -> None:
+        """The implicit warmup baseline must not enter profiling counter deltas."""
+        warmup = _build_agentic_warmup_config(mock_cfg.cfg.phases[0])
+        assert warmup is not None
+        pub_client = MagicMock()
+        pub_client.publish = AsyncMock()
+        publisher = PhasePublisher(pub_client=pub_client, service_id="timing-manager")
+        await publisher.publish_phase_baseline_request(warmup, "warmup", "start")
+
+        manager = MagicMock(spec=ServerMetricsManager)
+        manager._server_metrics_disabled = False
+        manager._collectors = {"http://node1:8081/metrics": MagicMock()}
+        manager._collect_and_process_metrics_for_phase = AsyncMock()
+        await ServerMetricsManager.collect_baseline(
+            manager, pub_client.publish.await_args.args[0]
+        )
+        baseline_phase = manager._collect_and_process_metrics_for_phase.await_args.args[
+            1
+        ]
+
+        processor = ServerMetricsAccumulator(mock_cfg)
+        for timestamp_ns, value, phase in (
+            (1_000_000_000, 0.0, baseline_phase),
+            (2_000_000_000, 100.0, CreditPhase.WARMUP),
+            (3_000_000_000, 100.0, CreditPhase.PROFILING),
+            (4_000_000_000, 120.0, CreditPhase.PROFILING),
+        ):
+            await processor.process_server_metrics_record(
+                ServerMetricsRecord(
+                    endpoint_url="http://node1:8081/metrics",
+                    timestamp_ns=timestamp_ns,
+                    endpoint_latency_ns=5_000_000,
+                    metrics={
+                        "requests": MetricFamily(
+                            type=PrometheusMetricType.COUNTER,
+                            description="Total requests",
+                            samples=[MetricSample(value=value)],
+                        )
+                    },
+                    benchmark_phase=phase,
+                )
+            )
+
+        result = await processor.export_results(
+            ExportContext(
+                start_ns=3_000_000_000,
+                end_ns=4_000_000_000,
+                warmup_start_ns=1_000_000_000,
+                warmup_end_ns=2_000_000_000,
+            )
+        )
+        assert result is not None
+        summary = next(iter(result.endpoint_summaries.values()))
+        assert summary.metrics["requests"].series[0].stats.total == 20.0
 
     async def test_export_results_warmup_includes_final_warmup_scrape(
         self,
